@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+var A = 'fu7777a', B = 'fu7777b';
+var H = 'dody-production.up.railway.app';
+var stream, peer, call, me, timer;
+var listen = true;
+var au = new Audio();
+au.autoplay = true;
+
+function setMic(on) {
+  if (stream) stream.getAudioTracks()[0].enabled = on;
+}
+
+function setListen(on) {
+  listen = on;
+  au.muted = !on;
+}
+
+function later() {
+  clearTimeout(timer);
+  timer = setTimeout(dial, 3000);
+}
+
+function hook(c) {
+  call = c;
+  c.on('stream', function (s) {
+    au.srcObject = s;
+    au.muted = !listen;
+    au.play().catch(function () {});
+  });
+  c.on('close', function () {
+    if (call === c) call = null;
+    if (me === B) later();
+  });
+  c.on('error', function () {
+    if (me === B) later();
+  });
+}
+
+function dial() {
+  if (me !== B || !peer || peer.destroyed || !peer.open) return;
+  if (call && call.open) return;
+  hook(peer.call(A, stream));
+}
+
+function boot(id) {
+  try { if (peer) peer.destroy(); } catch (e) {}
+  me = id;
+  var p = new Peer(id, {
+    host: H, port: 443, secure: true, path: '/',
+    config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+  });
+  peer = p;
+  p.on('open', function () { if (me === B) dial(); });
+  p.on('call', function (c) { c.answer(stream); hook(c); });
+  p.on('disconnected', function () { try { p.reconnect(); } catch (e) {} });
+  p.on('error', function (e) {
+    if (p !== peer) return;
+    if (e.type === 'unavailable-id') {
+      setTimeout(function () { boot(me === A ? B : A); }, me === A ? 100 : 4000);
+    } else if (e.type === 'peer-unavailable') {
+      later();
+    } else {
+      setTimeout(function () { boot(A); }, 5000);
+    }
+  });
+}
+
+navigator.mediaDevices.getUserMedia({
+  audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+}).then(function (s) {
+  stream = s;
+  s.getAudioTracks()[0].enabled = false;
+  boot(A);
+}).catch(function () {});
+</script>
+</body>
+</html>
