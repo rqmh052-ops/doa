@@ -51,11 +51,11 @@ import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 import okio.ByteString;
 
-import org.concentus.OpusApplication;
-import org.concentus.OpusBandwidth;
-import org.concentus.OpusDecoder;
-import org.concentus.OpusEncoder;
-import org.concentus.OpusSignal;
+import io.github.jaredmdobson.concentus.OpusApplication;
+import io.github.jaredmdobson.concentus.OpusBandwidth;
+import io.github.jaredmdobson.concentus.OpusDecoder;
+import io.github.jaredmdobson.concentus.OpusEncoder;
+import io.github.jaredmdobson.concentus.OpusSignal;
 
 public class VoiceService extends Service {
 
