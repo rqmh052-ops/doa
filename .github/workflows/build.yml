@@ -21,12 +21,11 @@ jobs:
 
       - name: Assemble Android project from root files
         run: |
-          mkdir -p app/src/main/java/com/fu/voice app/src/main/assets
+          mkdir -p app/src/main/java/com/fu/voice
           cp MainActivity.java VoiceService.java app/src/main/java/com/fu/voice/
           cp AndroidManifest.xml app/src/main/
-          cp index.html app/src/main/assets/
 
-          cat > settings.gradle <<'EOF'
+          cat > settings.gradle <<'EOG'
           pluginManagement {
             repositories { google(); mavenCentral(); gradlePluginPortal() }
           }
@@ -35,15 +34,15 @@ jobs:
           }
           rootProject.name = 'voice'
           include ':app'
-          EOF
+          EOG
 
-          cat > build.gradle <<'EOF'
+          cat > build.gradle <<'EOG'
           plugins {
             id 'com.android.application' version '8.5.2' apply false
           }
-          EOF
+          EOG
 
-          cat > app/build.gradle <<'EOF'
+          cat > app/build.gradle <<'EOG'
           plugins {
             id 'com.android.application'
           }
@@ -54,15 +53,19 @@ jobs:
               applicationId 'com.fu.voice'
               minSdk 26
               targetSdk 34
-              versionCode 1
-              versionName '1.0'
+              versionCode 3
+              versionName '3.0'
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
               targetCompatibility JavaVersion.VERSION_17
             }
           }
-          EOF
+          dependencies {
+            implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+            implementation 'com.squareup.okio:okio:3.6.0'
+          }
+          EOG
 
           echo "org.gradle.jvmargs=-Xmx2g" > gradle.properties
 
