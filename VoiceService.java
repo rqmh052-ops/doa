@@ -20,6 +20,9 @@ import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.AudioTrack;
 import android.media.MediaRecorder;
+import android.media.audiofx.AcousticEchoCanceler;
+import android.media.audiofx.AutomaticGainControl;
+import android.media.audiofx.NoiseSuppressor;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.wifi.WifiManager;
@@ -28,6 +31,8 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
+import android.util.Log;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -46,18 +51,50 @@ import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 import okio.ByteString;
 
+import org.concentus.OpusApplication;
+import org.concentus.OpusBandwidth;
+import org.concentus.OpusDecoder;
+import org.concentus.OpusEncoder;
+import org.concentus.OpusSignal;
+
 public class VoiceService extends Service {
 
-    static final String HOST = "dody-production.up.railway.app";
+    static final String HOST = "dody-production-18b9735d.up.railway.app";
     static final String KEY = "fu7777-k3x9q";
-    static final int RATE = 16000;
-    static final int FRAME = 320; // 20 ms of 16 kHz mono
+    static final int RATE = 16000;                 // 16 kHz mono 16-bit PCM
+    static final int FRAME_MS = 40;
+    static final int FRAME = RATE * FRAME_MS / 1000; // 640 samples = 40 ms = one Opus packet
 
-    static final short[] ULAW = new short[256];
+    // ---- audio source ----
+    static final int AUDIO_SRC = MediaRecorder.AudioSource.VOICE_COMMUNICATION;
+    static final int AUDIO_SRC_FALLBACK = MediaRecorder.AudioSource.MIC;
 
-    static {
-        for (int i = 0; i < 256; i++) ULAW[i] = ulawDecode((byte) i);
-    }
+    // ---- Opus encoder (tune here) ----
+    static final int OPUS_BITRATE = 12000;         // bps; raise to 14000-16000 if speech sounds bad
+    static final int COMPLEXITY = 5;               // 0-10; pure-Java codec, keep CPU low
+    static final boolean USE_DTX = true;           // codec built-in DTX only; set false if quiet speech is clipped
+    static final boolean USE_FEC = false;          // TCP never loses packets, FEC would waste bits
+    static final int DTX_MAX_BYTES = 2;            // packet <= this = silence/DTX packet
+    static final long DTX_MIN_INTERVAL_MS = 400;   // at most one silence packet per this time
+    static final int MAX_PACKET = 400;             // encoder output buffer
+
+    // ---- software AGC ----
+    static final float AGC_TARGET_RMS = 3000f;     // about -20 dBFS
+    static final float AGC_MAX_GAIN = 8f;          // +18 dB
+    static final float AGC_MIN_GAIN = 1f;
+    static final float AGC_ATTACK = 0.7f;          // gain falls: 70% of the way per frame (1-2 frames)
+    static final float AGC_RELEASE_STEP = 1.0471f; // gain rises +0.4 dB per 40 ms frame = +1 dB / 100 ms
+    static final float AGC_NOISE_FLOOR = 40f;      // frame RMS below this: hold gain (do not amplify hiss)
+    static final int LIMIT = 30000;                // hard limiter
+
+    // ---- playback / jitter buffer ----
+    static final int JB_START_FRAMES = 2;          // start after 80 ms queued...
+    static final int JB_START_MS = 150;            // ...or 150 ms after the first frame
+    static final int JB_MAX_FRAMES = 8;            // 320 ms: above this drop oldest...
+    static final int JB_CATCHUP_FRAMES = 4;        // ...down to this
+    static final int MAX_PLC = 3;                  // conceal up to 3 missing packets, else reset decoder
+    static final long GAP_RESET_MS = 1000;         // gap longer than this: reset decoder
+    static final int TRACK_FRAMES = 6;             // AudioTrack buffer (>= 4 frames)
 
     WindowManager wm;
     NotificationManager nm;
@@ -76,6 +113,7 @@ public class VoiceService extends Service {
     volatile long lastRx = 0;
     volatile long lastConnectAt = 0;
     volatile int attempt = 0;
+    volatile boolean decReset = false;  // set on reconnect: playback thread resets the Opus decoder
     String lastStatus = "";
 
     OkHttpClient client;
@@ -84,6 +122,10 @@ public class VoiceService extends Service {
     String devId;
     Thread micThread, playThread;
     final LinkedBlockingQueue<byte[]> queue = new LinkedBlockingQueue<>();
+
+    AutomaticGainControl fxAgc;
+    NoiseSuppressor fxNs;
+    AcousticEchoCanceler fxAec;
 
     PowerManager.WakeLock cpuLock;
     WifiManager.WifiLock wifiLock;
@@ -277,6 +319,8 @@ public class VoiceService extends Service {
             connected = true;
             attempt = 0;
             lastRx = System.currentTimeMillis();
+            decReset = true;
+            queue.clear();
             w.send(listenOn ? "L1" : "L0"); // server always learns our current listen state
             status();
         }
@@ -297,15 +341,10 @@ public class VoiceService extends Service {
             if (g != gen) return;
             lastRx = System.currentTimeMillis();
             if (!listenOn) return;
-            byte[] u = b.toByteArray();
-            byte[] pcm = new byte[u.length * 2];
-            for (int i = 0; i < u.length; i++) {
-                short s = ULAW[u[i] & 0xFF];
-                pcm[2 * i] = (byte) (s & 0xff);
-                pcm[2 * i + 1] = (byte) ((s >> 8) & 0xff);
-            }
-            while (queue.size() > 25) queue.poll(); // after a stall, jump forward instead of lagging
-            queue.offer(pcm);
+            byte[] d = b.toByteArray();
+            if (d.length < 1 || d.length > MAX_PACKET + 1) return;
+            queue.offer(d);                          // decoding happens on the playback thread
+            while (queue.size() > 40) queue.poll();  // safety only
         }
 
         @Override
@@ -350,26 +389,92 @@ public class VoiceService extends Service {
         return null;
     }
 
+    void attachEffects(int sid) {
+        try {
+            if (AutomaticGainControl.isAvailable()) {
+                fxAgc = AutomaticGainControl.create(sid);
+                if (fxAgc != null && !fxAgc.getEnabled()) fxAgc.setEnabled(true);
+            }
+        } catch (Exception e) { }
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                fxNs = NoiseSuppressor.create(sid);
+                if (fxNs != null && !fxNs.getEnabled()) fxNs.setEnabled(true);
+            }
+        } catch (Exception e) { }
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                fxAec = AcousticEchoCanceler.create(sid);
+                if (fxAec != null && !fxAec.getEnabled()) fxAec.setEnabled(true);
+            }
+        } catch (Exception e) { }
+    }
+
+    void releaseEffects() {
+        try { if (fxAgc != null) fxAgc.release(); } catch (Exception e) { }
+        try { if (fxNs != null) fxNs.release(); } catch (Exception e) { }
+        try { if (fxAec != null) fxAec.release(); } catch (Exception e) { }
+        fxAgc = null;
+        fxNs = null;
+        fxAec = null;
+    }
+
+    OpusEncoder newEncoder() throws Exception {
+        OpusEncoder e = new OpusEncoder(RATE, 1, OpusApplication.OPUS_APPLICATION_VOIP);
+        e.setSignalType(OpusSignal.OPUS_SIGNAL_VOICE);
+        e.setBitrate(OPUS_BITRATE);
+        e.setUseVBR(true);
+        e.setUseConstrainedVBR(false);
+        e.setMaxBandwidth(OpusBandwidth.OPUS_BANDWIDTH_WIDEBAND);
+        e.setComplexity(COMPLEXITY);
+        e.setUseDTX(USE_DTX);
+        e.setUseInbandFEC(USE_FEC);
+        return e;
+    }
+
+    // software AGC + hard limiter, in place. Returns the new gain.
+    static float applyAgc(short[] b, float g) {
+        long sum = 0;
+        for (int i = 0; i < b.length; i++) sum += (long) b[i] * b[i];
+        float rms = (float) Math.sqrt(sum / (double) b.length);
+        if (rms >= AGC_NOISE_FLOOR) {
+            float want = Math.max(AGC_MIN_GAIN, Math.min(AGC_MAX_GAIN, AGC_TARGET_RMS / rms));
+            if (want < g) g = g + (want - g) * AGC_ATTACK;           // fast down
+            else g = Math.min(want, g * AGC_RELEASE_STEP);            // slow up
+        } // else: too quiet, hold gain
+        for (int i = 0; i < b.length; i++) {
+            int v = Math.round(b[i] * g);
+            if (v > LIMIT) v = LIMIT; else if (v < -LIMIT) v = -LIMIT;
+            b[i] = (short) v;
+        }
+        return g;
+    }
+
     void micLoop() {
         AudioRecord rec = null;
         try {
             int min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-            int size = Math.max(min, FRAME * 2 * 8);
-            rec = openRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, size);
-            if (rec == null) rec = openRecord(MediaRecorder.AudioSource.MIC, size);
+            int size = Math.max(min, FRAME * 2 * 4);
+            rec = openRecord(AUDIO_SRC, size);
+            if (rec == null) rec = openRecord(AUDIO_SRC_FALLBACK, size);
             if (rec == null) {
                 micFailed();
                 return;
             }
+            attachEffects(rec.getAudioSessionId());
+            OpusEncoder enc = newEncoder();
             rec.startRecording();
             if (rec.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
                 micFailed();
                 return;
             }
             short[] buf = new short[FRAME];
-            byte[] cur = new byte[FRAME];
-            byte[][] pre = new byte[3][FRAME]; // last 60 ms before speech, so word starts are not clipped
-            int preCount = 0, preIdx = 0, hang = 0;
+            byte[] out = new byte[MAX_PACKET];
+            int seq = 0;
+            float gain = 1f;
+            long lastSmall = 0;
+            long statStart = SystemClock.elapsedRealtime();
+            long statBytes = 0, statPk = 0;
             while (micRun) {
                 int n = 0;
                 while (n < FRAME && micRun) {
@@ -386,29 +491,30 @@ public class VoiceService extends Service {
                 }
                 if (n < FRAME) break;
 
-                long sum = 0;
-                for (int i = 0; i < FRAME; i++) sum += (long) buf[i] * buf[i];
-                double rms = Math.sqrt(sum / (double) FRAME);
-                for (int i = 0; i < FRAME; i++) cur[i] = ulawEncode(buf[i]);
-
-                boolean speech = rms > 120;
-                if (speech || hang > 0) {
-                    if (hang == 0) { // speech just started: send the cushion first
-                        int start = (preIdx - preCount + 3) % 3;
-                        for (int k = 0; k < preCount; k++) sendFrame(pre[(start + k) % 3]);
-                        preCount = 0;
-                    }
-                    hang = speech ? 25 : hang - 1; // keep sending 500 ms after speech
-                    sendFrame(cur);
-                } else {
-                    System.arraycopy(cur, 0, pre[preIdx], 0, FRAME);
-                    preIdx = (preIdx + 1) % 3;
-                    if (preCount < 3) preCount++;
+                gain = applyAgc(buf, gain);
+                int len = enc.encode(buf, 0, FRAME, out, 0, out.length);
+                if (len <= 0) continue;
+                long now = SystemClock.elapsedRealtime();
+                if (USE_DTX && len <= DTX_MAX_BYTES) { // silence packet: at most one per 400 ms
+                    if (now - lastSmall < DTX_MIN_INTERVAL_MS) continue;
+                    lastSmall = now;
+                }
+                if (sendPacket(seq, out, len)) {       // speech packets are always sent
+                    seq = (seq + 1) & 0xFF;
+                    statBytes += len + 1;
+                    statPk++;
+                }
+                if (now - statStart >= 60000) {
+                    Log.d("VoiceData", "last minute: " + statBytes + " B payload, " + statPk + " packets");
+                    statStart = now;
+                    statBytes = 0;
+                    statPk = 0;
                 }
             }
         } catch (Exception e) {
             if (micRun) micFailed();
         } finally {
+            releaseEffects();
             if (rec != null) {
                 try { rec.stop(); } catch (Exception e) { }
                 rec.release(); // this is what really closes the microphone
@@ -417,9 +523,14 @@ public class VoiceService extends Service {
         }
     }
 
-    void sendFrame(byte[] f) {
+    // wire format: [1 byte seq][opus packet]
+    boolean sendPacket(int seq, byte[] p, int len) {
         WebSocket w = ws;
-        if (w != null && connected && w.queueSize() < 65536) w.send(ByteString.of(f, 0, FRAME));
+        if (w == null || !connected || w.queueSize() >= 65536) return false;
+        byte[] m = new byte[len + 1];
+        m[0] = (byte) seq;
+        System.arraycopy(p, 0, m, 1, len);
+        return w.send(ByteString.of(m));
     }
 
     void stopMic() {
@@ -446,6 +557,7 @@ public class VoiceService extends Service {
             try { prev.join(400); } catch (InterruptedException e) { }
         }
         playRun = true;
+        decReset = true;
         queue.clear();
         playThread = new Thread(this::playLoop, "voice-play");
         playThread.start();
@@ -463,27 +575,35 @@ public class VoiceService extends Service {
                         .setSampleRate(RATE)
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build())
-                .setBufferSizeInBytes(Math.max(min, FRAME * 2 * 10))
+                .setBufferSizeInBytes(Math.max(min, FRAME * 2 * TRACK_FRAMES))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
     }
 
     void playLoop() {
+        OpusDecoder dec = null;
+        short[] pcm = new short[FRAME];
         while (playRun) {
             AudioTrack t = null;
             try {
+                if (dec == null) dec = new OpusDecoder(RATE, 1);
+                dec.resetState();
                 t = newTrack();
                 t.play();
                 boolean primed = false, bad = false;
-                int waited = 0;
+                int waited = 0, expect = -1;
+                long lastAt = 0;
                 while (playRun && !bad) {
-                    if (!primed) { // small cushion (80 ms) before each burst so it doesn't stutter
+                    if (!primed) { // small cushion before each burst so it doesn't stutter
                         if (queue.isEmpty()) waited = 0; else waited += 10;
-                        if (queue.size() >= 4 || (waited >= 120 && !queue.isEmpty())) primed = true;
+                        if (queue.size() >= JB_START_FRAMES || (waited >= JB_START_MS && !queue.isEmpty())) primed = true;
                         else {
                             Thread.sleep(10);
                             continue;
                         }
+                    }
+                    if (queue.size() > JB_MAX_FRAMES) { // catch-up: drop oldest
+                        while (queue.size() > JB_CATCHUP_FRAMES) queue.poll();
                     }
                     byte[] f = queue.poll(100, TimeUnit.MILLISECONDS);
                     if (f == null) {
@@ -491,7 +611,38 @@ public class VoiceService extends Service {
                         waited = 0;
                         continue;
                     }
-                    if (t.write(f, 0, f.length) < 0) bad = true; // audio device changed: rebuild the track
+                    long now = SystemClock.elapsedRealtime();
+                    if (decReset || (lastAt != 0 && now - lastAt > GAP_RESET_MS)) {
+                        decReset = false;
+                        dec.resetState();
+                        expect = -1;
+                    }
+                    lastAt = now;
+
+                    int seq = f[0] & 0xFF;
+                    if (expect >= 0) {
+                        int miss = (seq - expect) & 0xFF;
+                        if (miss >= 1 && miss <= MAX_PLC) {
+                            for (int k = 0; k < miss && !bad; k++) { // conceal lost frames
+                                try {
+                                    dec.decode(null, 0, 0, pcm, 0, FRAME, false);
+                                    if (t.write(pcm, 0, FRAME) < 0) bad = true;
+                                } catch (Exception e) { }
+                            }
+                        } else if (miss != 0) {
+                            dec.resetState(); // too many missing: do not conceal
+                        }
+                    }
+                    expect = (seq + 1) & 0xFF;
+                    if (bad) break;
+
+                    int n;
+                    try {
+                        n = dec.decode(f, 1, f.length - 1, pcm, 0, FRAME, false);
+                    } catch (Exception e) {
+                        continue; // corrupt packet: skip
+                    }
+                    if (n > 0 && t.write(pcm, 0, n) < 0) bad = true; // audio device changed: rebuild the track
                 }
             } catch (InterruptedException e) {
                 break;
@@ -504,6 +655,7 @@ public class VoiceService extends Service {
                 }
             }
         }
+        dec = null; // pure Java: nothing else to release
         playRun = false;
     }
 
@@ -714,28 +866,6 @@ public class VoiceService extends Service {
                     return true;
             }
         }
-    }
-
-    // ---------- G.711 mu-law (halves the data: 16 KB/s instead of 32 KB/s) ----------
-    static byte ulawEncode(short pcm) {
-        int sign = (pcm >> 8) & 0x80;
-        int s = pcm;
-        if (sign != 0) s = -s;
-        if (s > 32635) s = 32635;
-        s += 0x84;
-        int exp = 7;
-        for (int mask = 0x4000; (s & mask) == 0 && exp > 0; exp--, mask >>= 1) { }
-        int mant = (s >> (exp + 3)) & 0x0F;
-        return (byte) ~(sign | (exp << 4) | mant);
-    }
-
-    static short ulawDecode(byte u) {
-        int v = ~u & 0xFF;
-        int sign = v & 0x80;
-        int exp = (v >> 4) & 7;
-        int mant = v & 0x0F;
-        int s = (((mant << 3) + 0x84) << exp) - 0x84;
-        return (short) (sign != 0 ? -s : s);
     }
 
     @Override
